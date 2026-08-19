@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+.yarn/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+build/
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Secrets
+*.pem
+*.key
+*.p12
+*.keystore
+
+# Uploads / generated files
+uploads/
+storage/
+tmp/
