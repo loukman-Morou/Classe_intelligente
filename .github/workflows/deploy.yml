@@ -1,0 +1,68 @@
+name: Deploy — Production
+
+# Déclenchement manuel uniquement (pas de déploiement automatique en prod).
+# Utiliser workflow_dispatch pour forcer un déploiement humain conscient.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag de l'image Docker à déployer (ex: sha-abc1234)'
+        required: true
+        type: string
+      confirm:
+        description: 'Tapez "deploy" pour confirmer le déploiement en production'
+        required: true
+        type: string
+
+jobs:
+  guard:
+    name: Vérification confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifier la confirmation
+        if: ${{ github.event.inputs.confirm != 'deploy' }}
+        run: |
+          echo "Confirmation invalide. Tapez exactement 'deploy' pour déployer."
+          exit 1
+
+  deploy:
+    name: Déploiement production
+    runs-on: ubuntu-latest
+    needs: guard
+    environment: production  # Nécessite une approbation manuelle dans GitHub Environments
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Exemple de déploiement sur un VPS via SSH.
+      # Adapter selon l'infrastructure (ECS, Fly.io, Railway, Render, Kubernetes…).
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/classe-intelligente
+
+            # Tirer la nouvelle image
+            docker pull ghcr.io/${{ github.repository }}:${{ github.event.inputs.image_tag }}
+
+            # Appliquer les migrations AVANT de redémarrer l'API
+            # DATABASE_URL_MIGRATE = user avec droits DDL (pas le user applicatif)
+            docker run --rm \
+              --env-file .env.production \
+              -e DATABASE_URL=${DATABASE_URL_MIGRATE} \
+              ghcr.io/${{ github.repository }}:${{ github.event.inputs.image_tag }} \
+              npx prisma migrate deploy
+
+            # Redémarrer l'API avec la nouvelle image
+            IMAGE_TAG=${{ github.event.inputs.image_tag }} \
+              docker compose -f docker-compose.prod.yml up -d --no-deps api
+
+            # Vérifier que l'API répond
+            sleep 10
+            wget -qO- http://localhost:3000/api/v1/health || exit 1
+
+            echo "Déploiement ${{ github.event.inputs.image_tag }} terminé."

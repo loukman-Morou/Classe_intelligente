@@ -1,0 +1,678 @@
+// ============================================================================
+// Classe Intelligente — schéma Prisma (Phase 1 : Base de données)
+// ============================================================================
+// Décisions de scope volontaires pour cette phase (voir docs/database.md) :
+//  - Pas de colonne `embedding` sur DocumentChunk : le type pgvector et sa
+//    dimension dépendent du modèle d'embeddings choisi en Phase 8. L'ajouter
+//    maintenant serait figer un choix technique qui n'appartient pas à cette
+//    phase (voir prompt maître §28 : ne jamais inventer une règle/décision
+//    qui n'est pas encore à faire).
+//  - RefreshToken (Phase 2) : voir le modèle `RefreshToken` plus bas — token
+//    opaque à haute entropie (pas un JWT), seul son hash est stocké, avec
+//    rotation et détection de rejeu. Choix documenté dans docs/security.md.
+//
+// DÉCISION (résout le point ouvert précédent, voir PROGRESS.md) : une classe a un
+// responsable principal obligatoire (`Class.ownerId`) et, optionnellement, UN
+// co-responsable (`Class.coOwnerId`). Pas de modèle "1 à 2 responsables via flag
+// booléen + trigger" : deux colonnes dédiées suffisent et sont plus simples à
+// raisonner (voir docs/database.md).
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  STUDENT
+  PROFESSOR
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum ClassStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+  PENDING_DELETION
+  DELETED
+}
+
+enum DocumentStatus {
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+  DELETED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
+// ----------------------------------------------------------------------------
+// Identité
+// ----------------------------------------------------------------------------
+
+model User {
+  id        String @id @default(uuid()) @db.Uuid
+  email     String @unique
+  firstName String
+  lastName  String
+  // Argon2id uniquement (Phase 2). Jamais de clair, MD5, SHA-1, SHA-256 — voir
+  // docs/security.md. Ce champ n'est jamais sérialisé dans une réponse API.
+  passwordHash String
+  role         UserRole
+  status       UserStatus @default(ACTIVE)
+
+  // Phase 2 — anti brute-force par compte, en complément du rate limiting par IP
+  // (voir docs/security.md §2/§Phase 2). Remis à zéro à chaque connexion réussie.
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  classMemberships    ClassMember[]
+  uploadedDocuments   Document[]        @relation("DocumentUploadedBy")
+  professorCourses    ProfessorCourse[]  @relation("ProfessorOwnsCourse")
+  conversations       Conversation[]
+  auditLogsAsActor    AuditLog[]        @relation("AuditLogActor")
+  notifications       Notification[]
+  ownedClasses        Class[]           @relation("ClassOwner")
+  coOwnedClasses      Class[]           @relation("ClassCoOwner")
+  refreshTokens       RefreshToken[]
+  proposalsSent       CourseUpdateProposal[] @relation("ProposalSentBy")
+  proposalsReviewed   CourseUpdateProposal[] @relation("ProposalReviewedBy")
+
+  @@index([role])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  // Seul le hash (SHA-256) du token est stocké — jamais le token brut, pour
+  // qu'une fuite de la base ne permette pas de rejouer une session. Contrairement
+  // aux mots de passe, un hash rapide suffit ici : le secret est un token
+  // aléatoire à haute entropie généré par le serveur, pas un secret choisi par un
+  // humain — voir docs/security.md (annexe).
+  tokenHash String    @unique
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  // Chaîne de rotation : ce token a-t-il déjà été échangé contre un nouveau ?
+  // Un refresh présentant un tokenHash déjà `revokedAt != null` est un signal de
+  // vol de token (rejeu) — voir AuthService.refresh(), qui révoque alors TOUTE la
+  // famille de tokens de l'utilisateur par précaution.
+  replacedByTokenId String? @unique @db.Uuid
+
+  // Contexte de la session, pour l'audit ("depuis quel contexte ?" — cahier des
+  // charges §21/docs/security.md §17). Jamais utilisé pour une décision
+  // d'autorisation.
+  ipAddress String?
+  userAgent String?
+
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  replacedBy  RefreshToken? @relation("RefreshTokenRotation", fields: [replacedByTokenId], references: [id], onDelete: SetNull)
+  replacesFor RefreshToken? @relation("RefreshTokenRotation")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ----------------------------------------------------------------------------
+// Classes / membres
+// ----------------------------------------------------------------------------
+
+model Class {
+  id           String      @id @default(uuid()) @db.Uuid
+  name         String
+  academicYear String
+  description  String?
+  status       ClassStatus @default(ACTIVE)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  // Responsable principal, obligatoire. Restrict : supprimer ce User exige de
+  // transférer la propriété d'abord (choix explicite du flux RGPD, Phase 13/18),
+  // jamais une suppression implicite qui laisserait la classe sans responsable.
+  ownerId String @db.Uuid
+  owner   User   @relation("ClassOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+
+  // Co-responsable optionnel (0 ou 1). SetNull : si ce compte est supprimé, le
+  // créneau de co-responsable redevient simplement libre — la classe garde son
+  // owner, donc rien d'implicite ou de dangereux à laisser cette référence
+  // devenir NULL automatiquement.
+  coOwnerId String? @db.Uuid
+  coOwner   User?   @relation("ClassCoOwner", fields: [coOwnerId], references: [id], onDelete: SetNull)
+
+  // Code court alphanumérique généré à la création (8 caractères, unique).
+  // Permet aux étudiants de rejoindre la classe sans lien d'invitation (Phase 3).
+  // Jamais modifiable par le client — uniquement par le système (rotation admin, Phase 12).
+  joinCode String @unique @db.VarChar(8)
+
+  // Dernière activité significative de la classe (question IA, upload document,
+  // nouveau membre, message). Mis à jour par le service métier (Phase 9, 6, 3…).
+  // Utilisé par le cron de détection d'inactivité (Phase 13).
+  // NULL = jamais d'activité depuis la création (traité comme la date de création).
+  lastActivityAt DateTime?
+
+  members      ClassMember[]
+  courses      Course[]
+  classCourses ClassCourse[]
+
+  // Dernière activité significative : mise à jour par AiService.chat,
+  // DocumentsService.completeUpload, CoursesService.create (fire-and-forget).
+  // Utilisée par LifecycleService pour détecter l'inactivité (Phase 13).
+  lastActivityAt DateTime?
+
+  // "Au plus 1 co-responsable" est déjà garanti par construction : `coOwnerId`
+  // est une colonne à une seule valeur, pas une collection. Le seul risque de
+  // concurrence restant est deux requêtes qui tentent de POURVOIR ce créneau en
+  // même temps : à traiter en Phase 3 par une mise à jour conditionnelle
+  // atomique (`UPDATE classes SET co_owner_id = $1 WHERE id = $2 AND
+  // co_owner_id IS NULL`), pas par un trigger — voir docs/database.md.
+
+  @@index([status])
+  @@index([lastActivityAt])
+  @@index([ownerId])
+  @@index([coOwnerId])
+  @@map("classes")
+}
+
+model ClassMember {
+  id       String   @id @default(uuid()) @db.Uuid
+  userId   String   @db.Uuid
+  classId  String   @db.Uuid
+  joinedAt DateTime @default(now())
+
+  // Le rôle "responsable" ne vit plus ici (voir Class.ownerId/coOwnerId) : cette
+  // table ne fait qu'attester qu'un utilisateur appartient à la classe (élève,
+  // et — par construction applicative, Phase 3 — le owner/co-owner aussi, pour
+  // qu'ils apparaissent dans la liste des membres et voient les cours).
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  class Class @relation(fields: [classId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, classId])
+  @@map("class_members")
+}
+
+// ----------------------------------------------------------------------------
+// Cours / professeurs
+// ----------------------------------------------------------------------------
+
+model Course {
+  id          String   @id @default(uuid()) @db.Uuid
+  classId     String?  @db.Uuid  // NULL pour un cours original professeur
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // classId est nullable : un ProfessorCourse n'appartient pas à une classe,
+  // il appartient à l'espace professeur. classId est renseigné uniquement pour
+  // les ClassCourse (copies dans une classe).
+  class               Class?               @relation(fields: [classId], references: [id], onDelete: Restrict)
+  documents           Document[]
+  conversations       Conversation[]
+  quizzes             Quiz[]
+  questionTopics      QuestionTopic[]
+  questionAnalytics   QuestionAnalytics[]
+  pedagogicalInsights PedagogicalInsight[]
+  professorCourse     ProfessorCourse?     @relation("CourseIsProfessorOriginal")
+  classCourse         ClassCourse?         @relation("CourseIsClassCopy")
+
+  @@index([classId])
+  @@map("courses")
+}
+
+// ----------------------------------------------------------------------------
+// Espace professeur (Phase 5)
+// ----------------------------------------------------------------------------
+
+enum CourseShareStatus {
+  ACTIVE    // copie vivante dans la classe
+  REVOKED   // le professeur a retiré le partage
+  ARCHIVED  // la classe a archivé ce cours
+}
+
+enum CourseSyncStatus {
+  UP_TO_DATE        // copie identique à la version partagée
+  UPDATE_AVAILABLE  // le prof a publié une nouvelle version, proposal en attente
+  DIVERGED          // la classe a modifié sa copie ET le prof a mis à jour l'original
+}
+
+enum ProposalStatus {
+  PENDING     // proposition en attente de décision du responsable
+  ACCEPTED    // le responsable a appliqué la mise à jour
+  REJECTED    // le responsable a refusé
+  CANCELLED   // le professeur a annulé sa proposition
+}
+
+enum ProposalType {
+  UPDATE        // mise à jour du contenu existant
+  CLARIFICATION // ajout d'une clarification ponctuelle
+}
+
+// Type de document dans l'espace professeur
+enum ProfessorDocumentType {
+  COURSE_MATERIAL  // support de cours normal
+  EXERCISE         // exercice
+  EXAM             // épreuve (sans corrigé)
+  CORRECTION       // corrigé d'une épreuve
+  RESOURCE         // ressource complémentaire
+}
+
+/**
+ * Cours ORIGINAL d'un professeur, dans son espace personnel.
+ * Indépendant de toute classe — le professeur le crée, l'enrichit,
+ * le versionne et le partage (copie) vers des classes.
+ */
+model ProfessorCourse {
+  id          String   @id @default(uuid()) @db.Uuid
+  professorId String   @db.Uuid
+  // courseId → Course.id : le cours original (Course.classId = NULL)
+  courseId    String   @unique @db.Uuid
+  // Version courante du cours (incrémentée à chaque modification significative)
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  professor    User          @relation("ProfessorOwnsCourse", fields: [professorId], references: [id], onDelete: Cascade)
+  course       Course        @relation("CourseIsProfessorOriginal", fields: [courseId], references: [id], onDelete: Restrict)
+  classCourses ClassCourse[]
+  proposals    CourseUpdateProposal[]
+  versions     CourseVersion[]
+  documents    Document[]    @relation("DocumentFromProfCourse")
+
+  @@index([professorId])
+  @@map("professor_courses")
+}
+
+/**
+ * Historique de versions d'un cours professeur.
+ * Permet la comparaison avant/après et le suivi des modifications.
+ */
+model CourseVersion {
+  id               String   @id @default(uuid()) @db.Uuid
+  professorCourseId String  @db.Uuid
+  version          Int
+  // Snapshot du contenu au moment de la version (titre, description, metadata)
+  snapshot         Json
+  changesDescription String?
+  createdAt        DateTime @default(now())
+
+  professorCourse ProfessorCourse @relation(fields: [professorCourseId], references: [id], onDelete: Cascade)
+
+  @@unique([professorCourseId, version])
+  @@index([professorCourseId])
+  @@map("course_versions")
+}
+
+/**
+ * Copie d'un cours professeur dans une classe.
+ * La classe possède sa propre copie (Course autonome) mais le lien vers
+ * l'original est conservé pour le radar pédagogique et les propositions
+ * de mise à jour.
+ */
+model ClassCourse {
+  id               String          @id @default(uuid()) @db.Uuid
+  // classCourseId → Course.id : la copie dans la classe (Course.classId = classId)
+  classCourseId    String          @unique @db.Uuid
+  professorCourseId String         @db.Uuid
+  classId          String          @db.Uuid
+  // Version de l'original au moment du partage
+  sharedAtVersion  Int
+  status           CourseShareStatus @default(ACTIVE)
+  // syncStatus : état de synchronisation entre la copie et l'original
+  syncStatus       CourseSyncStatus  @default(UP_TO_DATE)
+  sharedAt         DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  classCourse     Course          @relation("CourseIsClassCopy", fields: [classCourseId], references: [id], onDelete: Restrict)
+  professorCourse ProfessorCourse @relation(fields: [professorCourseId], references: [id], onDelete: Restrict)
+  class           Class           @relation(fields: [classId], references: [id], onDelete: Restrict)
+  proposals       CourseUpdateProposal[]
+
+  @@unique([professorCourseId, classId])
+  @@index([classId])
+  @@index([professorCourseId])
+  @@map("class_courses")
+}
+
+/**
+ * Proposition de mise à jour envoyée par le professeur vers une classe.
+ * Le responsable accepte ou refuse — jamais d'écrasement automatique.
+ */
+model CourseUpdateProposal {
+  id               String        @id @default(uuid()) @db.Uuid
+  professorCourseId String       @db.Uuid
+  classCourseId    String        @db.Uuid
+  proposedByUserId String        @db.Uuid
+  type             ProposalType  @default(UPDATE)
+  status           ProposalStatus @default(PENDING)
+  // Contenu de la proposition (delta ou snapshot selon le type)
+  proposalContent  Json
+  message          String?       // message optionnel du professeur au responsable
+  reviewedAt       DateTime?
+  reviewedByUserId String?       @db.Uuid
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  professorCourse  ProfessorCourse @relation(fields: [professorCourseId], references: [id], onDelete: Restrict)
+  classCourse      ClassCourse     @relation(fields: [classCourseId], references: [id], onDelete: Restrict)
+  proposedBy       User            @relation("ProposalSentBy", fields: [proposedByUserId], references: [id], onDelete: Restrict)
+  reviewedBy       User?           @relation("ProposalReviewedBy", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([classCourseId, status])
+  @@index([professorCourseId])
+  @@map("course_update_proposals")
+}
+
+// ----------------------------------------------------------------------------
+// Documents
+// ----------------------------------------------------------------------------
+
+model Document {
+  id       String  @id @default(uuid()) @db.Uuid
+  courseId String  @db.Uuid
+
+  uploadedByUserId String? @db.Uuid
+
+  // Nom d'origine conservé pour l'affichage UNIQUEMENT — jamais utilisé pour
+  // construire un chemin de stockage (protection path traversal, voir
+  // docs/security.md). `storageKey` est généré côté serveur (Phase 6).
+  originalFilename String
+  storageKey       String         @unique
+  mimeType         String
+  sizeBytes        Int
+  status           DocumentStatus @default(UPLOADED)
+
+  // Type du document (important pour l'espace professeur : distinguer un
+  // support de cours d'une épreuve ou d'un corrigé). Pour les documents
+  // uploadés directement dans une classe par le responsable, le type
+  // est COURSE_MATERIAL par défaut.
+  documentType     ProfessorDocumentType @default(COURSE_MATERIAL)
+
+  // Si ce document provient d'un cours professeur partagé, on trace l'origine.
+  // NULL pour les documents uploadés directement dans la classe par le responsable.
+  sourceProfessorCourseId String? @db.Uuid
+
+  // Corrigé associé à cette épreuve (nullable, EXAM uniquement)
+  correctionDocumentId String? @unique @db.Uuid
+
+  // Visibilité du corrigé (null = toujours visible, date = visible après cette date)
+  correctionVisibleAt DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  course              Course          @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  uploadedBy          User?           @relation("DocumentUploadedBy", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+  sourceProfCourse    ProfessorCourse? @relation("DocumentFromProfCourse", fields: [sourceProfessorCourseId], references: [id], onDelete: SetNull)
+  correctionDocument  Document?       @relation("ExamCorrection", fields: [correctionDocumentId], references: [id], onDelete: SetNull)
+  examFor             Document?       @relation("ExamCorrection")
+  chunks              DocumentChunk[]
+  processingJobs      ProcessingJob[]
+
+  @@index([courseId, status])
+  @@index([sourceProfessorCourseId])
+  @@map("documents")
+}
+
+model DocumentChunk {
+  id         String   @id @default(uuid()) @db.Uuid
+  documentId String   @db.Uuid
+  // Dénormalisés depuis Document→Course→Class : permet au RAG (Phase 8) de
+  // filtrer directement sur ces colonnes sans jointure supplémentaire sur le
+  // chemin critique d'autorisation.
+  courseId   String   @db.Uuid
+  classId    String   @db.Uuid
+  chunkIndex Int
+  content    String
+  createdAt  DateTime @default(now())
+
+  // Colonne `embedding vector(1536)` ajoutée par la migration SQL manuelle
+  // `prisma/migrations/manual/phase8_pgvector_embeddings.sql` (pgvector ne peut
+  // pas être déclaré nativement dans Prisma — voir README de la migration).
+  // Déclarée Unsupported pour que Prisma ne tente pas de la gérer ; toutes les
+  // opérations sur embedding passent par $queryRaw dans RagService.
+  // NULL = chunk en attente d'indexation (backfill asynchrone Phase 8).
+  embedding Unsupported("vector(1536)")?
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, chunkIndex])
+  @@index([courseId])
+  @@index([classId])
+  @@map("document_chunks")
+}
+
+// ----------------------------------------------------------------------------
+// Conversations IA
+// ----------------------------------------------------------------------------
+
+model Conversation {
+  id       String  @id @default(uuid()) @db.Uuid
+  courseId String  @db.Uuid
+  userId   String  @db.Uuid
+  // Mode anonyme (section 15) : le professeur ne doit pas pouvoir identifier
+  // l'étudiant. `userId` reste TOUJOURS renseigné (sécurité/anti-abus/audit,
+  // voir docs/security.md) — c'est la couche service qui ne l'expose jamais
+  // aux endpoints professeur quand isAnonymous=true. Ne jamais transformer ce
+  // champ en nullable pour "anonymiser" : cela casserait l'audit trail exigé.
+  isAnonymous Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  course   Course    @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  // onDelete: Restrict (volontaire) — la suppression/anonymisation d'un
+  // utilisateur qui a des conversations doit être un choix explicite du flux
+  // RGPD (Phase 13/18), pas un SetNull silencieux qui rendrait `userId` NULL
+  // sans distinction avec `isAnonymous`.
+  user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  messages Message[]
+
+  @@index([courseId])
+  @@index([userId])
+  @@map("conversations")
+}
+
+model Message {
+  id             String      @id @default(uuid()) @db.Uuid
+  conversationId String      @db.Uuid
+  role           MessageRole
+  content        String
+  // Références aux DocumentChunk cités par le LLM (Phase 9), format libre en
+  // attendant la structure exacte définie à cette phase.
+  sources        Json?
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@map("messages")
+}
+
+// ----------------------------------------------------------------------------
+// Quiz
+// ----------------------------------------------------------------------------
+
+model Quiz {
+  id        String   @id @default(uuid()) @db.Uuid
+  courseId  String   @db.Uuid
+  title     String
+  createdAt DateTime @default(now())
+
+  course    Course         @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  questions QuizQuestion[]
+
+  @@index([courseId])
+  @@map("quizzes")
+}
+
+model QuizQuestion {
+  id                 String   @id @default(uuid()) @db.Uuid
+  quizId             String   @db.Uuid
+  prompt             String
+  choices            Json
+  correctChoiceIndex Int
+  explanation        String?
+  createdAt          DateTime @default(now())
+
+  quiz Quiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  @@index([quizId])
+  @@map("quiz_questions")
+}
+
+// ----------------------------------------------------------------------------
+// Radar pédagogique (structure de données Phase 1 ; alimentation/logique Phase 11)
+// ----------------------------------------------------------------------------
+
+model QuestionTopic {
+  id        String   @id @default(uuid()) @db.Uuid
+  courseId  String   @db.Uuid
+  // Nom du thème détecté, ex: "Subnetting", "CIDR" (cahier des charges §20).
+  name      String
+  createdAt DateTime @default(now())
+
+  course    Course              @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  analytics QuestionAnalytics[]
+  insights  PedagogicalInsight[]
+
+  @@unique([courseId, name])
+  @@index([courseId])
+  @@map("question_topics")
+}
+
+model QuestionAnalytics {
+  id            String   @id @default(uuid()) @db.Uuid
+  courseId      String   @db.Uuid
+  questionTopicId String @db.Uuid
+  // Comptage agrégé uniquement — jamais de lien vers une question individuelle
+  // identifiable par le professeur (voir docs/security.md §9).
+  questionCount Int      @default(0)
+  updatedAt     DateTime @updatedAt
+
+  course        Course        @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  questionTopic QuestionTopic @relation(fields: [questionTopicId], references: [id], onDelete: Restrict)
+
+  @@unique([courseId, questionTopicId])
+  @@index([courseId])
+  @@map("question_analytics")
+}
+
+enum PedagogicalInsightSeverity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model PedagogicalInsight {
+  id              String                      @id @default(uuid()) @db.Uuid
+  courseId        String                      @db.Uuid
+  questionTopicId String                      @db.Uuid
+  severity        PedagogicalInsightSeverity
+  questionCount   Int
+  recommendation  String?
+  createdAt       DateTime                    @default(now())
+
+  course        Course        @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  questionTopic QuestionTopic @relation(fields: [questionTopicId], references: [id], onDelete: Restrict)
+
+  @@index([courseId])
+  @@map("pedagogical_insights")
+}
+
+// ----------------------------------------------------------------------------
+// Audit / notifications
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  actorUserId String?  @db.Uuid
+  action      String
+  targetType  String
+  targetId    String?
+  // Jamais de secret/token/mot de passe/contenu privé inutile ici — voir
+  // docs/security.md §Logs.
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  // SetNull volontaire : un audit log doit survivre à la suppression du
+  // compte acteur (obligation réglementaire de traçabilité), même si la
+  // référence utilisateur devient nulle.
+  actor User? @relation("AuditLogActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([action, createdAt])
+  @@index([targetType, targetId])
+  @@map("audit_logs")
+}
+
+// ----------------------------------------------------------------------------
+model Notification {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  type      String
+  payload   Json?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+// ----------------------------------------------------------------------------
+// Traitement asynchrone (Phase 6/7 — BullMQ)
+// ----------------------------------------------------------------------------
+
+enum ProcessingJobStatus {
+  QUEUED      // job créé, en attente dans BullMQ
+  PROCESSING  // worker en cours de traitement
+  DONE        // traitement terminé avec succès
+  FAILED      // traitement échoué (voir errorMessage)
+}
+
+/**
+ * Suivi des jobs de traitement asynchrone liés à un document.
+ * BullMQ est la source de vérité pour l'état du job en temps réel ;
+ * cette table permet aux requêtes HTTP de consulter le statut sans
+ * interroger Redis, et conserve l'historique pour l'audit.
+ */
+model ProcessingJob {
+  id           String               @id @default(uuid()) @db.Uuid
+  documentId   String               @db.Uuid
+  jobType      String               // ex: "OCR", "CHUNKING", "EMBEDDING"
+  bullJobId    String?              // ID retourné par BullMQ (pour lookup direct)
+  status       ProcessingJobStatus  @default(QUEUED)
+  // Jamais de stack trace complète ici (voir docs/security.md §16) —
+  // uniquement un code d'erreur ou message court pour le support.
+  errorMessage String?
+  attempts     Int                  @default(0)
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([status])
+  @@map("processing_jobs")
+}

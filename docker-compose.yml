@@ -1,0 +1,33 @@
+version: '3.9'
+
+# Usage dev local uniquement. Ne jamais utiliser ces identifiants en production —
+# en prod, les credentials viennent d'un gestionnaire de secrets, pas de ce fichier.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: classe_intelligente
+      POSTGRES_PASSWORD: dev_only_change_me
+      POSTGRES_DB: classe_intelligente
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:6379:6379'
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:

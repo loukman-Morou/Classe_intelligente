@@ -1,0 +1,111 @@
+version: '3.9'
+# =============================================================================
+# Stack production — Classe Intelligente
+#
+# Usage :
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Secrets : ne jamais écrire les vraies valeurs ici.
+# Utiliser un gestionnaire de secrets (Vault, AWS Secrets Manager, Doppler…)
+# et les injecter via --env-file .env.production (hors dépôt Git).
+# =============================================================================
+
+services:
+  api:
+    image: classe-intelligente:latest
+    build: .
+    restart: unless-stopped
+    env_file: .env.production
+    ports:
+      - '127.0.0.1:3000:3000'   # Exposé uniquement sur localhost — le reverse proxy gère TLS
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+    # Logs structurés pino → stdout → collecté par Loki / CloudWatch / Datadog
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Script d'init : crée un user applicatif aux privilèges minimaux
+      - ./scripts/db-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER} -d ${DB_NAME}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - internal
+    # PostgreSQL n'est PAS exposé sur Internet — uniquement accessible depuis le réseau interne.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - internal
+    # Redis n'est PAS exposé sur Internet.
+
+  # ---------------------------------------------------------------------------
+  # Backup PostgreSQL — job quotidien via cron dans un conteneur dédié
+  # En production réelle, utiliser un service géré (RDS, Supabase, Neon…)
+  # qui offre des sauvegardes automatiques avec point-in-time recovery.
+  # Ce conteneur est un fallback pour les déploiements auto-hébergés.
+  # ---------------------------------------------------------------------------
+  backup:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    env_file: .env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - backupdata:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    # Cron toutes les 24h à 03:00 UTC
+    entrypoint: >
+      sh -c "
+        echo '0 3 * * * /backup.sh' | crontab - &&
+        crond -f -l 2
+      "
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  backupdata:

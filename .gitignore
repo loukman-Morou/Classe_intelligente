@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+build/
+
+# env — ne jamais committer de secrets réels
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+# coverage
+coverage/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# uploads locaux de dev (jamais de vrais documents utilisateur en repo)
+storage-local/
+
+# Docker volumes locaux
+.docker-data/

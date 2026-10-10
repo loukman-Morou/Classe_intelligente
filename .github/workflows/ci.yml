@@ -1,0 +1,271 @@
+name: CI — Classe Intelligente
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  NODE_VERSION: '22'
+  IMAGE_NAME: classe-intelligente
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Lint & type check
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+  # ---------------------------------------------------------------------------
+  # 2. Tests unitaires + sécurité (sans DB)
+  # ---------------------------------------------------------------------------
+  test-unit:
+    name: Tests unitaires & sécurité
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Tests unitaires
+        run: npm run test -- --forceExit --coverage
+        env:
+          # Variables minimales pour que ConfigModule ne rejette pas au démarrage des tests
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+          JWT_ACCESS_SECRET: test-access-secret-32-chars-minimum
+          JWT_REFRESH_SECRET: test-refresh-secret-32-chars-minimum
+          STORAGE_ENDPOINT: https://test.r2.cloudflarestorage.com
+          STORAGE_REGION: auto
+          STORAGE_BUCKET: test
+          STORAGE_ACCESS_KEY: test
+          STORAGE_SECRET_KEY: test
+          REDIS_URL: redis://localhost:6379
+          OPENAI_API_KEY: sk-test
+          CORS_ALLOWED_ORIGINS: http://localhost:3001
+
+      - name: Tests sécurité (IDOR, RBAC, upload, concurrence)
+        run: npm run test:security
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+          JWT_ACCESS_SECRET: test-access-secret-32-chars-minimum
+          JWT_REFRESH_SECRET: test-refresh-secret-32-chars-minimum
+          STORAGE_ENDPOINT: https://test.r2.cloudflarestorage.com
+          STORAGE_REGION: auto
+          STORAGE_BUCKET: test
+          STORAGE_ACCESS_KEY: test
+          STORAGE_SECRET_KEY: test
+          REDIS_URL: redis://localhost:6379
+          OPENAI_API_KEY: sk-test
+          CORS_ALLOWED_ORIGINS: http://localhost:3001
+
+      - name: Upload couverture
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+
+  # ---------------------------------------------------------------------------
+  # 3. Tests e2e (avec services DB réels)
+  # ---------------------------------------------------------------------------
+  test-e2e:
+    name: Tests e2e
+    runs-on: ubuntu-latest
+    needs: lint
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: classe_intelligente
+          POSTGRES_PASSWORD: ci_test_password
+          POSTGRES_DB: classe_intelligente
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run migrations
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://classe_intelligente:ci_test_password@localhost:5432/classe_intelligente
+
+      - name: Apply pgvector migrations manuelles
+        run: |
+          psql $DATABASE_URL \
+            -f prisma/migrations/manual/phase8_pgvector_embeddings.sql
+          psql $DATABASE_URL \
+            -f prisma/migrations/manual/phase8_pgvector_indexes.sql
+        env:
+          DATABASE_URL: postgresql://classe_intelligente:ci_test_password@localhost:5432/classe_intelligente
+
+      - name: Tests e2e
+        run: npm run test:e2e
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://classe_intelligente:ci_test_password@localhost:5432/classe_intelligente
+          REDIS_URL: redis://localhost:6379
+          JWT_ACCESS_SECRET: ci-access-secret-32-chars-minimum-00
+          JWT_REFRESH_SECRET: ci-refresh-secret-32-chars-minimum-0
+          JWT_ACCESS_TTL: 15m
+          JWT_REFRESH_TTL: 30d
+          STORAGE_ENDPOINT: https://test.r2.cloudflarestorage.com
+          STORAGE_REGION: auto
+          STORAGE_BUCKET: test
+          STORAGE_ACCESS_KEY: test
+          STORAGE_SECRET_KEY: test
+          OPENAI_API_KEY: sk-test
+          CORS_ALLOWED_ORIGINS: http://localhost:3001
+
+  # ---------------------------------------------------------------------------
+  # 4. Audit des dépendances
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Échoue si une vulnérabilité HIGH ou CRITICAL est trouvée.
+      # En cas d'urgence (faux positif), ajouter l'exception dans .nsprc.
+      - name: Audit sécurité dépendances
+        run: npm run audit:deps
+
+  # ---------------------------------------------------------------------------
+  # 5. Build Docker (vérification de l'image, pas de push sur PR)
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-e2e, dependency-audit]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:pr-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # 6. Push image (uniquement sur merge dans main)
+  # ---------------------------------------------------------------------------
+  docker-push:
+    name: Docker push
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GitHub Container Registry (ghcr.io). Remplacer par Docker Hub ou ECR
+      # selon l'infrastructure cible.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
